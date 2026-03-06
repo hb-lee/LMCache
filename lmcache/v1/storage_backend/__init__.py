@@ -18,6 +18,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+from lmcache.v1.storage_backend.xio_backend import XIOBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -243,6 +244,35 @@ def CreateStorageBackends(
             dst_device,
             storage_backends,
         )
+
+    # Wrap backends with XIOBackend if enabled in config
+    if config.extra_config is not None and config.extra_config.get(
+        "xio_enabled", False
+    ):
+        # Get XIO configuration
+        xio_config = config.extra_config.get("xio_config", {})
+        chunk_size = xio_config.get("chunk_size", 64 * 1024 * 1024)  # Default: 64MB
+        max_workers = xio_config.get("max_workers", 4)
+        backends_to_wrap = xio_config.get("backends_to_wrap", ["LocalDiskBackend", "RemoteBackend"])
+        
+        # Wrap specified backends with XIOBackend
+        xio_wrapped_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
+        for name, backend in storage_backends.items():
+            if name in backends_to_wrap and not isinstance(backend, LocalCPUBackend):
+                # Skip LocalCPUBackend as it's usually used as a buffer
+                xio_backend = XIOBackend(
+                    underlying_backend=backend,
+                    chunk_size=chunk_size,
+                    max_workers=max_workers,
+                    dst_device=dst_device,
+                )
+                xio_wrapped_backends[name] = xio_backend
+                logger.info(f"Wrapped {name} with XIOBackend (chunk_size={chunk_size}, max_workers={max_workers})")
+            else:
+                xio_wrapped_backends[name] = backend
+        
+        # Replace storage_backends with the wrapped ones
+        storage_backends = xio_wrapped_backends
 
     # Only wrap if audit is enabled in config
     if config.extra_config is not None and config.extra_config.get(
