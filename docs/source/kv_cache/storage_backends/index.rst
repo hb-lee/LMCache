@@ -23,6 +23,5 @@ Supported Backends
    sagemaker_hyperpod
    valkey
    weka
-   
-   
-  
+   xio_backend
+

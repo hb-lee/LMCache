@@ -15,6 +15,7 @@ from typing import (
 import asyncio
 import gc
 import multiprocessing
+import threading
 import time
 
 # Third Party
@@ -674,8 +675,23 @@ class LMCacheEngine:
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         reordered_chunks: List[ProcessedChunk] = []
+        xio_pipelined = (
+            self.config.enable_xio_backend
+            and not self.async_loading
+            and not self.save_only_first_rank
+        )
         if not self._is_passive():
-            if self.async_loading:
+            if xio_pipelined:
+                # XIO pipelined: get and to_gpu overlap per chunk
+                reordered_chunks, tot_kv_size = (
+                    self._process_tokens_internal_xio(
+                        tokens,
+                        mask,
+                        ret_mask,
+                        **kwargs,
+                    )
+                )
+            elif self.async_loading:
                 reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
                     tokens,
                     mask,
@@ -709,7 +725,9 @@ class LMCacheEngine:
         # cpu tensor for the sake of performance.
         # For example, disk->gpu is faster than disk->cpu->gpu.
         # RDMA is another example.
-        if len(reordered_chunks) > 0:
+        # When XIO pipelined mode was used, to_gpu was already called
+        # per-chunk inside the callback, so we skip the batched call.
+        if len(reordered_chunks) > 0 and not xio_pipelined:
             _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
             self.gpu_connector.batched_to_gpu(
                 list(memory_objs), list(starts), list(ends), **kwargs
@@ -1510,6 +1528,107 @@ class LMCacheEngine:
                 for key, memory_obj, start, end in reordered_chunks
                 if end < last_failed_block_start
             ]
+        return reordered_chunks, tot_kv_size
+
+    def _process_tokens_internal_xio(
+        self,
+        tokens,
+        mask,
+        ret_mask,
+        **kwargs,
+    ) -> ProcessTokensInternalResult:
+        """Process tokens with pipelined get+to_gpu using XIO callback.
+
+        Each chunk's to_gpu copy is initiated as soon as its data is
+        retrieved from any storage level, overlapping the fetch of
+        remaining chunks.  All to_gpu ops run on the gpu_connector's
+        load_stream and are synchronized after the full batch completes.
+        """
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None
+
+        tot_kv_size = 0
+        reordered_chunks: List[ProcessedChunk] = []
+        chunk_lock = threading.Lock()
+
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        chunk_infos: List[Tuple[CacheEngineKey, int, int]] = []
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            chunk_infos.append((key, start, end))
+
+        if not chunk_infos:
+            return [], 0
+
+        all_keys = [key for key, _, _ in chunk_infos]
+
+        load_stream = getattr(self.gpu_connector, "load_stream", None)
+
+        # -- common bookkeeping for ALL backend types --
+        def on_retrieved(
+            batch_keys: List[CacheEngineKey],
+            batch_objs: List[MemoryObj],
+            starts: List[int],
+            ends: List[int],
+        ):
+            nonlocal tot_kv_size
+            with torch.inference_mode(), chunk_lock:
+                for key, obj, start, end in zip(
+                    batch_keys, batch_objs, starts, ends, strict=False,
+                ):
+                    reordered_chunks.append((key, obj, start, end))
+                    tot_kv_size += obj.get_size()
+                    ret_mask[start:end] = True
+
+        # -- to_gpu for fan-out backends (per-key pipeline) --
+        def on_chunk_ready(
+            key: CacheEngineKey,
+            memory_obj: MemoryObj,
+            start: int,
+            end: int,
+        ):
+            if load_stream is not None:
+                with torch.cuda.stream(load_stream):
+                    self.gpu_connector.to_gpu(
+                        memory_obj, start, end, **kwargs
+                    )
+            else:
+                self.gpu_connector.to_gpu(memory_obj, start, end, **kwargs)
+
+        # -- to_gpu for batched backends --
+        def on_batch_ready(
+            batch_keys: List[CacheEngineKey],
+            batch_objs: List[MemoryObj],
+            starts: List[int],
+            ends: List[int],
+        ):
+            self.gpu_connector.batched_to_gpu(
+                batch_objs, starts, ends, **kwargs
+            )
+
+        self.storage_manager.batched_get_pipelined(
+            keys=all_keys,
+            on_chunk_ready=on_chunk_ready,
+            on_batch_ready=on_batch_ready,
+            on_retrieved=on_retrieved,
+            chunk_infos=chunk_infos,
+            **kwargs,
+        )
+
+        # Synchronize load_stream for per-chunk to_gpu calls.
+        # batched_to_gpu already synchronizes internally, and
+        # direct_transfer backends handle their own sync, so this
+        # only matters for the fan-out path.
+        if load_stream is not None:
+            load_stream.synchronize()
+
         return reordered_chunks, tot_kv_size
 
     def _broadcast_or_receive_memory_objs(

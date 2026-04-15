@@ -249,7 +249,7 @@ class StorageManager:
         self.allocator_backend = None
         if metadata.role != "scheduler":
             self.allocator_backend = self._get_allocator_backend(config)
-        if config.local_cpu:
+        if config.local_cpu and "LocalCPUBackend" in self.storage_backends:
             self.local_cpu_backend = self.storage_backends["LocalCPUBackend"]
 
         self.manager_lock = threading.Lock()
@@ -307,7 +307,9 @@ class StorageManager:
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
     ) -> AllocatorBackendInterface:
-        if self.enable_pd:
+        if config.enable_xio_backend and "XIOBackend" in self.storage_backends:
+            allocator_backend = self.storage_backends["XIOBackend"]
+        elif self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
         else:
             allocator_backend = self.storage_backends["LocalCPUBackend"]
@@ -496,6 +498,72 @@ class StorageManager:
                     memory_objs_no_none = cast(List[MemoryObj], memory_objs)
                     local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
                 return memory_objs
+        return None
+
+    def batched_get_pipelined(
+        self,
+        keys: List[CacheEngineKey],
+        on_chunk_ready: Any = None,
+        on_batch_ready: Any = None,
+        on_retrieved: Any = None,
+        chunk_infos: Optional[List[Tuple[CacheEngineKey, int, int]]] = None,
+        location: Optional[str] = None,
+        **kwargs,
+    ) -> Optional[List[Optional[MemoryObj]]]:
+        """
+        Pipelined batched get with adaptive callback strategy.
+
+        :param on_chunk_ready: ``(key, obj, start, end) -> None``
+            fired per-key for to_gpu (fan-out backends).
+        :param on_batch_ready: ``(keys, objs, starts, ends) -> None``
+            fired per-batch for to_gpu (batched backends).
+        :param on_retrieved: ``(keys, objs, starts, ends) -> None``
+            fired for every successful retrieval regardless of backend
+            type, for common bookkeeping (ret_mask, tot_kv_size, etc.).
+        :param chunk_infos: ``[(key, start, end), ...]``
+        :param kwargs: forwarded to backends with fused get+transfer.
+        """
+        for backend_name, storage_backend in self.get_active_storage_backends(
+            location
+        ):
+            if hasattr(storage_backend, "batched_get_pipelined"):
+                memory_objs = storage_backend.batched_get_pipelined(
+                    keys,
+                    on_chunk_ready=on_chunk_ready,
+                    on_batch_ready=on_batch_ready,
+                    on_retrieved=on_retrieved,
+                    chunk_infos=chunk_infos,
+                    **kwargs,
+                )
+                if memory_objs:
+                    return memory_objs
+            else:
+                # Non-pipelined path: regular batched_get, fire callback after
+                memory_objs = storage_backend.batched_get_blocking(keys)
+                if memory_objs:
+                    if on_batch_ready is not None:
+                        ok_keys, ok_objs, ok_starts, ok_ends = [], [], [], []
+                        for i, m in enumerate(memory_objs):
+                            if m is not None:
+                                if chunk_infos is not None:
+                                    _, s, e = chunk_infos[i]
+                                else:
+                                    s, e = i, i + 1
+                                ok_keys.append(keys[i])
+                                ok_objs.append(m)
+                                ok_starts.append(s)
+                                ok_ends.append(e)
+                        if ok_objs:
+                            on_batch_ready(ok_keys, ok_objs, ok_starts, ok_ends)
+                    elif on_chunk_ready is not None:
+                        for i, m in enumerate(memory_objs):
+                            if m is not None:
+                                if chunk_infos is not None:
+                                    _, s, e = chunk_infos[i]
+                                else:
+                                    s, e = i, i + 1
+                                on_chunk_ready(keys[i], m, s, e)
+                    return memory_objs
         return None
 
     def layerwise_batched_get(

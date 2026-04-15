@@ -18,6 +18,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+from lmcache.v1.storage_backend.xio_backend import XIOBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -224,7 +225,49 @@ def CreateStorageBackends(
             else:
                 audited_backends[name] = backend
                 logger.info(f"Do not wrap {name} as it is a LocalCPUBackend")
-        return audited_backends
-    else:
-        # If audit is not enabled, use the original backends
-        return storage_backends
+        storage_backends = audited_backends
+
+    # Wrap all backends in XIOBackend if enabled
+    if config.enable_xio_backend and len(storage_backends) > 0:
+        # Apply custom backend ordering if configured
+        xio_order = None
+        if config.extra_config:
+            xio_order = config.extra_config.get("xio_backend_order")
+        if xio_order:
+            ordered: OrderedDict[str, StorageBackendInterface] = OrderedDict()
+            for name in xio_order:
+                if name in storage_backends:
+                    ordered[name] = storage_backends[name]
+                else:
+                    logger.warning(
+                        "xio_backend_order: '%s' not found in created "
+                        "backends, skipping",
+                        name,
+                    )
+            # Append remaining backends not explicitly ordered
+            for name, backend in storage_backends.items():
+                if name not in ordered:
+                    ordered[name] = backend
+            storage_backends = ordered
+            logger.info(
+                "XIO backend order applied: %s",
+                list(storage_backends.keys()),
+            )
+
+        levels = list(storage_backends.items())
+        xio_backend = XIOBackend(
+            config=config,
+            metadata=metadata,
+            levels=levels,
+            loop=loop,
+            dst_device=dst_device,
+        )
+        xio_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
+        xio_backends["XIOBackend"] = xio_backend
+        logger.info(
+            "XIOBackend enabled: wrapped %d backends into multi-level cache",
+            len(levels),
+        )
+        return xio_backends
+
+    return storage_backends

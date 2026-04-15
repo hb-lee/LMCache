@@ -434,6 +434,17 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # XIO Backend configurations
+    "enable_xio_backend": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": (
+            "Enable XIO multi-level cache backend. When enabled, "
+            "all configured backends are wrapped into a single XIOBackend "
+            "that provides automatic cross-level data promotion."
+        ),
+    },
     # TODO(chunxiaozheng): remove this after VLLMPagedMemGPUConnectorV3 is stable
     "use_gpu_connector_v3": {
         "type": bool,
